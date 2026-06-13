@@ -32,9 +32,18 @@ clone_dep() {
         echo "  $dir already present — skipping"
     fi
 }
-clone_dep https://github.com/pedronaugusto/mtlbvh.git        mtlbvh
-clone_dep https://github.com/pedronaugusto/mtldiffrast.git   mtldiffrast
-clone_dep https://github.com/pedronaugusto/mtlmesh.git       mtlmesh
+# mtlbvh / mtldiffrast / mtlmesh are pinned to lastowl forks that merge
+# correctness fixes still open upstream as PRs (the forks' only delta):
+#   mtlbvh      <- pedronaugusto/mtlbvh#1   (BVH traversal stack 24->64;
+#                  fixes holey/fragmented remesh on large meshes)
+#   mtldiffrast <- pedronaugusto/mtldiffrast#3 (nvdiffrast-matching depth
+#                  test; fixes UV-seam speckle in baked textures)
+#   mtlmesh     <- pedronaugusto/mtlmesh#1 (Apple7/8 float-atomic fallback,
+#                  M1/M2) + #2 (hash/simplify correctness)
+# Switch each back to pedronaugusto/* once its PR(s) merge upstream.
+clone_dep https://github.com/lastowl/mtlbvh.git              mtlbvh
+clone_dep https://github.com/lastowl/mtldiffrast.git         mtldiffrast
+clone_dep https://github.com/lastowl/mtlmesh.git            mtlmesh
 clone_dep https://github.com/pedronaugusto/mtlgemm.git       mtlgemm
 clone_dep https://github.com/pedronaugusto/trellis2-apple.git trellis2-apple
 clone_dep https://github.com/lastowl/mtlattn.git              mtlattn
