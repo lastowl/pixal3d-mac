@@ -96,13 +96,14 @@ flash-attention-style variable-length kernel for MPS (simdgroup-matrix
 tiling, fp32 online softmax, no padding, no materialized score matrix).
 It handles all windowed sparse attention (~20× over padded SDPA) and any
 full attention above ~20K tokens — where torch's own MPS SDPA either
-needs a 54 GiB score tensor or, worse, **silently returns garbage for
-large score matrices** (empirically ≥ ~24K tokens at 12 heads; an upstream
-PyTorch MPS bug this kernel both exposed and sidesteps — see
-`deps/mtlattn/tests/test_mps_sdpa_bug.py`). End-to-end: 12.2 min per
-1024-cascade generation on an M5 Pro (was 22 min at first light),
-GPU-bound at ~74% mean utilization. Remaining gap vs a 4090-class CUDA
-setup: ~3-4×.
+needs a 54 GiB score tensor or, worse, **silently returns garbage once the
+score matrix exceeds ~2³² elements** (a known upstream PyTorch MPS bug,
+[pytorch#179352](https://github.com/pytorch/pytorch/issues/179352), fixed
+by the in-progress [#179592](https://github.com/pytorch/pytorch/pull/179592)
+— reproduces on torch ≤ 2.12; mtlattn sidesteps it entirely). End-to-end:
+12.2 min per 1024-cascade generation on an M5 Pro (was 22 min at first
+light), GPU-bound at ~74% mean utilization. Remaining gap vs a 4090-class
+CUDA setup: ~3-4×.
 
 ## Credits
 
