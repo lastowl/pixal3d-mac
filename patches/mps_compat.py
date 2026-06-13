@@ -496,10 +496,16 @@ def patch_naf():
 
 
 def patch_mesh_base():
-    """Guard cumesh/flex_gemm imports; make fill_holes device-agnostic
-    (mtlmesh's 2026-04-21 bounds-check fix made it safe on Metal — verified
-    up to 900K faces / 133K boundary loops); skip remove_faces/simplify,
-    which are unused on the inference path."""
+    """Guard cumesh/flex_gemm imports; make decode-time fill_holes
+    device-agnostic and re-enabled (it was skipped following trellis-mac's
+    original workaround). Apple9 (M3/M4/M5) runs cumesh fill_holes natively;
+    Apple7/8 (M1/M2) need mtlmesh's float-atomic fallback
+    (pedronaugusto/mtlmesh#1, still unmerged) — until then the decode-time
+    caller wraps the call in try/except so M1/M2 degrade to small holes
+    instead of crashing (see patch_pipeline_fill_holes_fallback). Verified
+    on M5 up to 900K faces / 133K boundary loops. remove_faces/simplify stay
+    skipped (unused on the inference path). Approach informed by
+    NoahBPeterson's trellis-mac#11."""
     path = os.path.join(PIXAL_ROOT, "pixal3d/representations/mesh/base.py")
     src = read_file(path)
     orig = src
@@ -523,10 +529,11 @@ def patch_mesh_base():
 
     # fill_holes: enabled and device-agnostic (MtlMesh.init moves tensors to
     # MPS itself; mesh.read() output is restored via the existing .to(self.device)).
-    if "safe on Metal since mtlmesh bounds-check fix" not in src:
+    if "cumesh unavailable" not in src:
         enabled = (
             "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
-            "        # safe on Metal since mtlmesh bounds-check fix (2026-04-21)\n"
+            "        if cumesh is None:\n"
+            "            return  # cumesh unavailable (CPU-only build)\n"
             "        vertices = self.vertices.clone().contiguous()\n"
             "        faces = self.faces.clone().contiguous()"
         )
@@ -564,6 +571,40 @@ def patch_mesh_base():
         write_file(path, src)
     else:
         print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
+
+
+def patch_pipeline_fill_holes_fallback():
+    """Wrap the decode-time m.fill_holes() call in try/except so users on
+    Apple7/8 (M1/M2) with an mtlmesh that lacks the float-atomic fallback
+    (pedronaugusto/mtlmesh#1) degrade to a mesh with small holes plus a
+    one-time warning, instead of crashing the whole pipeline. No-op on
+    Apple9, where fill_holes runs natively. (Pattern from NoahBPeterson's
+    trellis-mac#11.)"""
+    path = os.path.join(PIXAL_ROOT, "pixal3d/pipelines/pixal3d_image_to_3d.py")
+    src = read_file(path)
+
+    if "fill_holes failed" in src:
+        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
+        return
+
+    src = sub(
+        src,
+        "        for m, v in zip(meshes, tex_voxels):\n"
+        "            m.fill_holes()",
+        "        for m, v in zip(meshes, tex_voxels):\n"
+        "            try:\n"
+        "                m.fill_holes()\n"
+        "            except Exception as _fh_err:\n"
+        "                import warnings\n"
+        "                warnings.warn(\n"
+        "                    f\"fill_holes failed ({type(_fh_err).__name__}); shipping mesh \"\n"
+        "                    \"with small holes. On M1/M2, update mtlmesh to a build with \"\n"
+        "                    \"pedronaugusto/mtlmesh#1 (Apple7/8 float-atomic fallback).\",\n"
+        "                    RuntimeWarning,\n"
+        "                )",
+        path,
+    )
+    write_file(path, src)
 
 
 def patch_fdg_vae():
@@ -738,6 +779,7 @@ def main():
     patch_image_conditioned_proj()
     patch_naf()
     patch_mesh_base()
+    patch_pipeline_fill_holes_fallback()
     patch_fdg_vae()
     patch_pipeline()
     patch_inference()
