@@ -717,6 +717,35 @@ def patch_inference_tmpdir():
     write_file(path, src)
 
 
+def patch_inference_alpha_mode():
+    """Force opaque GLBs back to alphaMode=OPAQUE before export — works
+    around o_voxel's hair-trigger BLEND flag on bf16 drift texels
+    (pedronaugusto/trellis2-apple#1). Without this, opaque models render
+    see-through in glTF viewers."""
+    path = os.path.join(PIXAL_ROOT, "inference.py")
+    src = read_file(path)
+
+    if "fix_alpha_mode" in src:
+        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
+        return
+
+    src = sub(
+        src,
+        "    # Apply rotation\n",
+        "    import sys as _sys, os as _os\n"
+        "    _sys.path.append(_os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'backends'))\n"
+        "    try:\n"
+        "        from glb_postprocess import fix_alpha_mode\n"
+        "        fix_alpha_mode(glb)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "\n"
+        "    # Apply rotation\n",
+        path,
+    )
+    write_file(path, src)
+
+
 def patch_inference_to_glb_cpu():
     """Hand mesh tensors to o_voxel.postprocess.to_glb on CPU. The Metal
     o_voxel/cumesh stack creates internal tensors on CPU and mixes them with
@@ -785,6 +814,7 @@ def main():
     patch_inference()
     patch_inference_tmpdir()
     patch_inference_to_glb_cpu()
+    patch_inference_alpha_mode()
     install_conv_backend()
     install_mesh_extract()
 

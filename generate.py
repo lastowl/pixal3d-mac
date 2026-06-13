@@ -174,6 +174,11 @@ def run_batch():
                 remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
             )
             glb.apply_transform(rot)
+            try:
+                from backends.glb_postprocess import fix_alpha_mode
+                fix_alpha_mode(glb)
+            except Exception:
+                pass
             glb.export(out_path, extension_webp=True)
             print(f"  Saved {out_path} in {time.time() - t1:.0f}s")
         except Exception as e:
