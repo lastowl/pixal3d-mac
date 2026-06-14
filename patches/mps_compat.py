@@ -167,10 +167,13 @@ def _sdpa_varlen(q, k, v, q_seq_lens, kv_seq_lens):
 
 def patch_full_attn_mtlattn():
     """Hybrid full-attention dispatch inside the upstream sdpa branch:
-    above MTLATTN_MIN_SEQLEN tokens, use the fused Metal varlen kernel —
-    torch's MPS sdpa materializes the [H, L, L] score matrix there (the
-    1536-pipeline OOM: 54 GiB at 49K tokens) while mtlattn streams in
-    constant memory. Below the threshold torch sdpa is faster; keep it."""
+    above MTLATTN_MIN_SEQLEN tokens, use mtlattn (the fused Metal varlen
+    kernel). On M5 it dispatches to the Neural Accelerator and beats torch
+    MPS sdpa above ~4K tokens; it also streams in constant memory where sdpa
+    materializes the [H, L, L] score matrix (the 1536 OOM: 54 GiB at 49K),
+    and is the only correct option above ~24K where sdpa silently corrupts.
+    Default 4096 -> 1024's HR full attention (~12-18K tok) accelerates too;
+    below that torch sdpa is marginally faster, so keep it."""
     path = os.path.join(PIXAL_ROOT, "pixal3d/modules/sparse/attention/full_attn.py")
     src = read_file(path)
 
@@ -216,7 +219,7 @@ def patch_full_attn_mtlattn():
         "from .. import config",
         "from .. import config\n"
         "import os as _os\n"
-        "_MTLATTN_MIN_SEQLEN = int(_os.environ.get('MTLATTN_MIN_SEQLEN', 20000))",
+        "_MTLATTN_MIN_SEQLEN = int(_os.environ.get('MTLATTN_MIN_SEQLEN', 4096))",
         path,
     )
     write_file(path, src)
