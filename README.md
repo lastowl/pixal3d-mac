@@ -53,6 +53,9 @@ python generate.py --batch images/ --output-dir out/
 
 # Multi-view: several posed views of one object (forwards to inference_mv.py)
 python generate.py --views_dir views/ --output out/model.glb
+
+# Web UI (single image and multi-view tabs) at http://127.0.0.1:7860
+python app_mac.py
 ```
 
 ### Multiple views
@@ -68,6 +71,15 @@ background-matted automatically; they are not cropped, so frame them the way
 the cameras describe. `--num_views N` uses only the first N views. See the
 [upstream README](https://github.com/TencentARC/Pixal3D#multi-view-inference)
 for the camera convention.
+
+The web UI's **Multiple views** tab does the four-shot case without a
+`transforms.json`: drop the front, left, back and right shots into their
+slots (only the front is required), or upload your own `transforms.json` plus
+images under *Custom cameras*. The single-image and multi-view weights don't
+both fit comfortably in 64 GB, so the UI keeps one pipeline loaded and swaps
+when you generate from the other tab (about 70 s). Four views at 1024 take
+~10 min in the UI on a 64 GB M5 Pro; the loaded models stay resident through
+export, so expect ~17 GB of swap there (the CLI frees them first: ~7 GB).
 
 `generate.py` supports the official flags (`--seed`, `--fov`,
 `--resolution 1024|1536`, `--low_vram`) and **auto-configures by unified
