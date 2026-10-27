@@ -15,12 +15,20 @@ einsum — chunked over the folded batch to bound peak memory.
 install() monkey-patches natten.functional so code that did
 `from natten.functional import na2d_qk, na2d_av` before or after install
 gets MPS dispatch for MPS tensors and the original kernels for CPU tensors.
+When natten isn't installed (its 0.17.x CPU build doesn't compile against
+torch >= 2.14), install() registers a stand-in `natten` package backed by
+this implementation on every device instead.
 """
+
+import importlib.machinery
+import sys
+import types
 
 import torch
 
 _orig_qk = None
 _orig_av = None
+_standin = False
 
 # Per-chunk element budget for the gathered neighborhood tensor
 # (B'*h*Hs*kh*Ws*kw*d). 2^28 elements ~= 1 GiB in fp32.
@@ -96,7 +104,7 @@ def _av_dense(attn, v, kh, kw):
 
 
 def _supported(t, kernel_size, dilation, extra=None):
-    if t.device.type != "mps":
+    if t.device.type != "mps" and not _standin:
         return False
     kh, kw = _norm_pair(kernel_size)
     dh, dw = _norm_pair(dilation)
@@ -127,10 +135,36 @@ def na2d_av(attn, v, kernel_size, dilation=1, *args, **kwargs):
     return _from_subgrids(out, B, dh, dw)
 
 
+def _unsupported(*args, **kwargs):
+    raise NotImplementedError(
+        "natten stand-in: this neighborhood-attention shape needs the real natten package")
+
+
+def _register_standin():
+    """Register a minimal `natten` / `natten.functional` in sys.modules.
+    A real __spec__ lets torch.hub's dependency check (find_spec) see it."""
+    global _standin
+    pkg = types.ModuleType("natten")
+    pkg.__spec__ = importlib.machinery.ModuleSpec("natten", None, is_package=True)
+    pkg.__path__ = []
+    nf = types.ModuleType("natten.functional")
+    nf.__spec__ = importlib.machinery.ModuleSpec("natten.functional", None)
+    nf.na2d_qk = nf.na2d_av = _unsupported
+    pkg.functional = nf
+    sys.modules["natten"] = pkg
+    sys.modules["natten.functional"] = nf
+    _standin = True
+    return nf
+
+
 def install():
-    """Patch natten.functional in place. Idempotent."""
+    """Patch natten.functional in place, registering the stand-in package
+    if natten isn't installed. Idempotent."""
     global _orig_qk, _orig_av
-    import natten.functional as nf
+    try:
+        import natten.functional as nf
+    except ImportError:
+        nf = _register_standin()
 
     if getattr(nf, "_mps_shim_installed", False):
         return

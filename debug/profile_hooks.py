@@ -46,20 +46,12 @@ def _printer():
 
 
 def install():
-    # Attention: the fused Metal kernel
+    # Attention: torch MPS SDPA (the sdpa backends import it at call time)
     try:
-        import mtlattn
-        mtlattn.varlen_attention = _timed("attention: mtlattn", mtlattn.varlen_attention)
+        import torch.nn.functional as F
+        F.scaled_dot_product_attention = _timed("attention: sdpa", F.scaled_dot_product_attention)
     except Exception as e:
-        print("[profile] mtlattn hook failed:", e)
-
-    # Sparse attention dispatch (incl. serialization/window-partition overhead)
-    try:
-        from pixal3d.modules.sparse.attention import windowed_attn as wa
-        wa.sparse_windowed_scaled_dot_product_self_attention = _timed(
-            "attn+serialize: windowed", wa.sparse_windowed_scaled_dot_product_self_attention)
-    except Exception as e:
-        print("[profile] windowed hook failed:", e)
+        print("[profile] sdpa hook failed:", e)
 
     # Sparse 3D convolution
     try:

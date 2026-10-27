@@ -44,23 +44,25 @@ def unified_memory_gb():
         return 0.0
 
 
-def auto_defaults():
+def auto_defaults(batch=False):
     """Pick pipeline defaults from the machine's unified memory.
 
     Pixal3D standard mode keeps ~18 GB of models resident. Tiers
     (overridable via explicit CLI flags):
-      >= 96 GB: full-quality 1536 cascade, everything resident
+      >= 64 GB: full-quality 1536 cascade (single image; batch mode needs
+                >= 96 GB, see below)
       >= 24 GB: 1024 cascade, everything resident
       <  24 GB: 1024 cascade, low-VRAM mode (models loaded per stage),
                 reduced sparse-token budget
 
-    The 1536 cascade's working set is ~90 GB on MPS (measured OOM on a
-    64 GB M5 Pro: 77 GiB allocated + a 13 GiB request against an 88 GiB
-    cap) — the padded-SDPA attention intermediates dominate. Until that's
-    optimized, 1536 is only defaulted on 96 GB+ machines.
+    The 1536 export (narrow-band remesh + UV unwrap + bake) is the memory
+    peak: ~100 GB footprint on its own, which a 64 GB Mac covers with memory
+    compression and 10–13 GB of swap once the models are freed first
+    (inference.py does that). Batch mode keeps the models resident through
+    export, so it only defaults to 1536 on 96 GB+.
     """
     gb = unified_memory_gb()
-    if gb >= 96:
+    if gb >= (96 if batch else 64):
         return {"resolution": 1536, "low_vram": False, "max_num_tokens": 49152, "ram_gb": gb}
     if gb >= 24:
         return {"resolution": 1024, "low_vram": False, "max_num_tokens": 49152, "ram_gb": gb}
@@ -74,7 +76,7 @@ def run_batch():
     parser = argparse.ArgumentParser(description="Pixal3D batch generation (resident models)")
     parser.add_argument("--batch", type=str, required=True, help="Directory of input images")
     parser.add_argument("--output-dir", type=str, default="out", help="Output directory for GLBs")
-    auto = auto_defaults()
+    auto = auto_defaults(batch=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resolution", type=int, default=auto["resolution"], choices=[1024, 1536],
                         help=f"default auto-selected for {auto['ram_gb']:.0f} GB unified memory: {auto['resolution']}")
@@ -164,6 +166,9 @@ def run_batch():
                 max_num_tokens=args.max_num_tokens,
             )
             mesh = mesh_list[0]
+            del mesh_list
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()  # cached sampling/decode buffers
 
             glb = o_voxel.postprocess.to_glb(
                 vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(),
@@ -174,11 +179,6 @@ def run_batch():
                 remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
             )
             glb.apply_transform(rot)
-            try:
-                from backends.glb_postprocess import fix_alpha_mode
-                fix_alpha_mode(glb)
-            except Exception:
-                pass
             glb.export(out_path, extension_webp=True)
             print(f"  Saved {out_path} in {time.time() - t1:.0f}s")
         except Exception as e:

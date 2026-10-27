@@ -57,7 +57,7 @@ ROT = np.array(
 
 def load_models(resolution_override=None):
     global PIPELINE, MOGE, DEFAULTS
-    DEFAULTS = auto_defaults()
+    DEFAULTS = auto_defaults(batch=True)  # models stay resident between requests
     if resolution_override:
         DEFAULTS["resolution"] = resolution_override
     print(f"[app] {DEFAULTS['ram_gb']:.0f} GB unified memory -> "
@@ -107,6 +107,9 @@ def generate_fn(image, seed, fov, resolution, progress=gr.Progress()):
         pipeline_type=f"{resolution}_cascade", max_num_tokens=DEFAULTS["max_num_tokens"],
     )
     mesh = mesh_list[0]
+    del mesh_list
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()  # cached sampling/decode buffers
 
     progress(0.85, desc="Baking textures + GLB")
     glb = o_voxel.postprocess.to_glb(
@@ -118,11 +121,6 @@ def generate_fn(image, seed, fov, resolution, progress=gr.Progress()):
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
     )
     glb.apply_transform(ROT)
-    try:
-        from backends.glb_postprocess import fix_alpha_mode
-        fix_alpha_mode(glb)
-    except Exception:
-        pass
     out_path = os.path.join(out_dir, f"pixal3d_{stamp}_{int(time.time())}.glb")
     glb.export(out_path, extension_webp=True)
     if torch.backends.mps.is_available():

@@ -3,8 +3,6 @@ Apply MPS (Apple Silicon) compatibility patches to a fresh Pixal3D clone.
 
 Pixal3D is built on the TRELLIS.2 codebase, so this follows the same recipe
 as trellis-mac (https://github.com/shivampkumar/trellis-mac):
-  - SDPA attention backend for the sparse windowed attention (upstream already
-    has SDPA branches for full attention, but not windowed)
   - Metal/pure-PyTorch backends for the CUDA-only libraries
   - device-agnostic rewrites of hardcoded .cuda() calls on the inference path
   - skip decode-time cumesh ops (Metal cumesh is unstable on decode-sized meshes)
@@ -46,183 +44,6 @@ def sub(src, old, new, path, count=-1):
 
 
 BEST_DEVICE = "torch.device('mps') if torch.backends.mps.is_available() else torch.device('cuda')"
-
-
-def patch_windowed_attention():
-    """Add an SDPA backend to sparse windowed attention (self + cross).
-
-    Upstream dispatches on config.ATTN with xformers/flash_attn/flash_attn_4
-    branches only. We add vectorized pad -> SDPA -> unpad branches: windows
-    number in the thousands, so a Python per-window loop would dominate
-    runtime; instead sequences are scattered into a padded batch with a key
-    padding mask.
-    """
-    path = os.path.join(PIXAL_ROOT, "pixal3d/modules/sparse/attention/windowed_attn.py")
-    src = read_file(path)
-
-    if "_sdpa_varlen" in src:
-        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
-        return
-
-    helpers = '''
-
-def _mtlattn():
-    """Fused Metal varlen attention (mtlattn), or None if unavailable."""
-    global _MTLATTN_MOD
-    try:
-        return _MTLATTN_MOD
-    except NameError:
-        pass
-    try:
-        import mtlattn as _m
-        _MTLATTN_MOD = _m
-    except ImportError:
-        _MTLATTN_MOD = None
-    return _MTLATTN_MOD
-
-
-def _sdpa_pad(feats, seq_lens):
-    """Scatter [M, H, C] feats (concatenated variable-length sequences) into a
-    padded [B, H, L, C] batch. Returns (padded, batch_idx, pos_idx) where the
-    index pair maps padded positions back to rows of feats."""
-    device = feats.device
-    B = seq_lens.shape[0]
-    L = int(seq_lens.max())
-    offsets = torch.cumsum(seq_lens, dim=0) - seq_lens
-    batch_idx = torch.repeat_interleave(torch.arange(B, device=device), seq_lens)
-    pos_idx = torch.arange(feats.shape[0], device=device) - offsets[batch_idx]
-    padded = torch.zeros(B, L, feats.shape[1], feats.shape[2], dtype=feats.dtype, device=device)
-    padded[batch_idx, pos_idx] = feats
-    return padded.permute(0, 2, 1, 3), batch_idx, pos_idx
-
-
-def _sdpa_varlen(q, k, v, q_seq_lens, kv_seq_lens):
-    """Variable-length attention. On MPS, prefers the fused Metal kernel
-    (mtlattn): no padding, no materialized scores, and it sidesteps a
-    torch MPS bug where masked SDPA silently corrupts outputs for large
-    score matrices (empirically heads*L^2 above ~7e9). Falls back to
-    padded SDPA.
-    q: [Mq, H, C]; k, v: [Mkv, H, C]. Returns [Mq, H, C]."""
-    if q.device.type == 'mps' and _mtlattn() is not None:
-        zero = torch.zeros(1, dtype=torch.int32, device=q.device)
-        cu_q = torch.cat([zero, torch.cumsum(q_seq_lens, 0).int()])
-        cu_kv = cu_q if kv_seq_lens is q_seq_lens else torch.cat(
-            [zero, torch.cumsum(kv_seq_lens, 0).int()])
-        return _mtlattn().varlen_attention(q, k, v, cu_q, cu_kv, int(q_seq_lens.max()))
-    from torch.nn.functional import scaled_dot_product_attention as sdpa
-    qp, q_bidx, q_pidx = _sdpa_pad(q, q_seq_lens)
-    kp, _, _ = _sdpa_pad(k, kv_seq_lens)
-    vp, _, _ = _sdpa_pad(v, kv_seq_lens)
-    Lk = kp.shape[2]
-    kv_mask = torch.arange(Lk, device=q.device).unsqueeze(0) < kv_seq_lens.unsqueeze(1)
-    out = sdpa(qp, kp, vp, attn_mask=kv_mask[:, None, None, :])
-    out = out.permute(0, 2, 1, 3)
-    return out[q_bidx, q_pidx]
-
-'''
-    src = sub(
-        src,
-        "__all__ = [",
-        helpers.rstrip("\n") + "\n\n\n__all__ = [",
-        path, count=1,
-    )
-
-    # calc_window_partition: sdpa needs no precomputed args
-    src = sub(
-        src,
-        "    return fwd_indices, bwd_indices, seq_lens, attn_func_args",
-        "    elif config.ATTN == 'sdpa':\n"
-        "        attn_func_args = {}\n"
-        "\n"
-        "    return fwd_indices, bwd_indices, seq_lens, attn_func_args",
-        path, count=1,
-    )
-
-    # self-attention dispatch
-    src = sub(
-        src,
-        "    out = out[bwd_indices]      # [T, H, C]",
-        "    elif config.ATTN == 'sdpa':\n"
-        "        q, k, v = qkv_feats.unbind(dim=1)                                       # [M, H, C]\n"
-        "        out = _sdpa_varlen(q, k, v, seq_lens, seq_lens)                         # [M, H, C]\n"
-        "\n"
-        "    out = out[bwd_indices]      # [T, H, C]",
-        path, count=1,
-    )
-
-    # cross-attention dispatch
-    src = sub(
-        src,
-        "    out = out[q_bwd_indices]      # [T, H, C]",
-        "    elif config.ATTN == 'sdpa':\n"
-        "        k, v = kv_feats.unbind(dim=1)                                           # [M, H, C]\n"
-        "        out = _sdpa_varlen(q_feats, k, v, q_seq_lens, kv_seq_lens)              # [M, H, C]\n"
-        "\n"
-        "    out = out[q_bwd_indices]      # [T, H, C]",
-        path, count=1,
-    )
-
-    write_file(path, src)
-
-
-def patch_full_attn_mtlattn():
-    """Hybrid full-attention dispatch inside the upstream sdpa branch:
-    above MTLATTN_MIN_SEQLEN tokens, use mtlattn (the fused Metal varlen
-    kernel). On M5 it dispatches to the Neural Accelerator and beats torch
-    MPS sdpa above ~4K tokens; it also streams in constant memory where sdpa
-    materializes the [H, L, L] score matrix (the 1536 OOM: 54 GiB at 49K),
-    and is the only correct option above ~24K where sdpa silently corrupts.
-    Default 4096 -> 1024's HR full attention (~12-18K tok) accelerates too;
-    below that torch sdpa is marginally faster, so keep it."""
-    path = os.path.join(PIXAL_ROOT, "pixal3d/modules/sparse/attention/full_attn.py")
-    src = read_file(path)
-
-    if "mtlattn" in src:
-        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
-        return
-
-    src = sub(
-        src,
-        "    elif config.ATTN == 'sdpa':\n"
-        "        from torch.nn.functional import scaled_dot_product_attention as _sdpa\n"
-        "        if num_all_args == 1:\n"
-        "            q, k, v = qkv.unbind(dim=1)   # [T, H, C] each\n"
-        "        elif num_all_args == 2:\n"
-        "            k, v = kv.unbind(dim=1)        # [T_KV, H, C] each\n"
-        "        # process each batch element independently (no varlen kernel needed)\n",
-        "    elif config.ATTN == 'sdpa':\n"
-        "        from torch.nn.functional import scaled_dot_product_attention as _sdpa\n"
-        "        if num_all_args == 1:\n"
-        "            q, k, v = qkv.unbind(dim=1)   # [T, H, C] each\n"
-        "        elif num_all_args == 2:\n"
-        "            k, v = kv.unbind(dim=1)        # [T_KV, H, C] each\n"
-        "        _kv_seqlen = kv_seqlen if kv_seqlen is not None else q_seqlen\n"
-        "        if (q.device.type == 'mps' and max(_kv_seqlen) > _MTLATTN_MIN_SEQLEN):\n"
-        "            try:\n"
-        "                import mtlattn\n"
-        "            except ImportError:\n"
-        "                mtlattn = None\n"
-        "            if mtlattn is not None:\n"
-        "                cu_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)\n"
-        "                cu_kv = cu_q if kv_seqlen is None else torch.cat(\n"
-        "                    [torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)\n"
-        "                out = mtlattn.varlen_attention(q, k, v, cu_q, cu_kv, max(q_seqlen))\n"
-        "                if s is not None:\n"
-        "                    return s.replace(out)\n"
-        "                else:\n"
-        "                    return out.reshape(N, L, H, -1)\n"
-        "        # process each batch element independently (no varlen kernel needed)\n",
-        path,
-    )
-    src = sub(
-        src,
-        "from .. import config",
-        "from .. import config\n"
-        "import os as _os\n"
-        "_MTLATTN_MIN_SEQLEN = int(_os.environ.get('MTLATTN_MIN_SEQLEN', 4096))",
-        path,
-    )
-    write_file(path, src)
 
 
 def patch_pipeline_base():
@@ -422,11 +243,11 @@ def patch_image_conditioned_proj():
 
 def patch_naf():
     """Run the NAF upsampler (torch.hub valeoai/NAF) on MPS via the
-    pure-PyTorch natten shim (backends/natten_mps_shim.py) — natten itself
-    hard-exits on MPS tensors and its CPU kernels cost minutes per call at
-    1536-pipeline sizes (~25x slower than the shim). Falls back to CPU if
-    the shim can't install. NAF stays fp32 either way (weights are fp32;
-    natten CPU kernels don't support fp16)."""
+    pure-PyTorch natten shim (backends/natten_mps_shim.py), which also stands
+    in for the natten package itself — natten hard-exits on MPS tensors, its
+    CPU kernels cost minutes per call at 1536-pipeline sizes, and 0.17.x
+    no longer builds against torch >= 2.14. NAF stays fp32 (its weights are
+    fp32)."""
     path = os.path.join(PIXAL_ROOT, "pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py")
     src = read_file(path)
 
@@ -502,11 +323,9 @@ def patch_mesh_base():
     """Guard cumesh/flex_gemm imports; make decode-time fill_holes
     device-agnostic and re-enabled (it was skipped following trellis-mac's
     original workaround). Apple9 (M3/M4/M5) runs cumesh fill_holes natively;
-    Apple7/8 (M1/M2) need mtlmesh's float-atomic fallback
-    (pedronaugusto/mtlmesh#1, still unmerged) — until then the decode-time
-    caller wraps the call in try/except so M1/M2 degrade to small holes
-    instead of crashing (see patch_pipeline_fill_holes_fallback). Verified
-    on M5 up to 900K faces / 133K boundary loops. remove_faces/simplify stay
+    Apple7/8 (M1/M2) use mtlmesh's float-atomic fallback
+    (pedronaugusto/mtlmesh#1, merged and included in the pinned mtlmesh).
+    Verified on M5 up to 900K faces / 133K boundary loops. remove_faces/simplify stay
     skipped (unused on the inference path). Approach informed by
     NoahBPeterson's trellis-mac#11."""
     path = os.path.join(PIXAL_ROOT, "pixal3d/representations/mesh/base.py")
@@ -576,40 +395,6 @@ def patch_mesh_base():
         print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
 
 
-def patch_pipeline_fill_holes_fallback():
-    """Wrap the decode-time m.fill_holes() call in try/except so users on
-    Apple7/8 (M1/M2) with an mtlmesh that lacks the float-atomic fallback
-    (pedronaugusto/mtlmesh#1) degrade to a mesh with small holes plus a
-    one-time warning, instead of crashing the whole pipeline. No-op on
-    Apple9, where fill_holes runs natively. (Pattern from NoahBPeterson's
-    trellis-mac#11.)"""
-    path = os.path.join(PIXAL_ROOT, "pixal3d/pipelines/pixal3d_image_to_3d.py")
-    src = read_file(path)
-
-    if "fill_holes failed" in src:
-        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
-        return
-
-    src = sub(
-        src,
-        "        for m, v in zip(meshes, tex_voxels):\n"
-        "            m.fill_holes()",
-        "        for m, v in zip(meshes, tex_voxels):\n"
-        "            try:\n"
-        "                m.fill_holes()\n"
-        "            except Exception as _fh_err:\n"
-        "                import warnings\n"
-        "                warnings.warn(\n"
-        "                    f\"fill_holes failed ({type(_fh_err).__name__}); shipping mesh \"\n"
-        "                    \"with small holes. On M1/M2, update mtlmesh to a build with \"\n"
-        "                    \"pedronaugusto/mtlmesh#1 (Apple7/8 float-atomic fallback).\",\n"
-        "                    RuntimeWarning,\n"
-        "                )",
-        path,
-    )
-    write_file(path, src)
-
-
 def patch_fdg_vae():
     """Force the pure-Python flexible_dual_grid_to_mesh: the Metal o_voxel
     convert segfaults on decoder output (same failure trellis-mac hit)."""
@@ -640,7 +425,10 @@ def patch_fdg_vae():
 
 
 def patch_pipeline():
-    """Guard torch.cuda.synchronize()/empty_cache() in the main pipeline."""
+    """Map torch.cuda.synchronize()/empty_cache() in the main pipeline to
+    their MPS equivalents. empty_cache matters: upstream calls it between
+    stages, and on torch 2.14 the MPS allocator otherwise keeps every
+    stage's cached buffers until export (1536 then runs out of memory)."""
     path = os.path.join(PIXAL_ROOT, "pixal3d/pipelines/pixal3d_image_to_3d.py")
     src = read_file(path)
 
@@ -658,7 +446,8 @@ def patch_pipeline():
     src = sub(
         src,
         "torch.cuda.empty_cache()",
-        "(torch.cuda.empty_cache() if torch.cuda.is_available() else None)",
+        "(torch.cuda.empty_cache() if torch.cuda.is_available()\n"
+        "         else torch.mps.empty_cache() if torch.backends.mps.is_available() else None)",
         path,
     )
     write_file(path, src)
@@ -693,7 +482,8 @@ def patch_inference():
     src = sub(
         src,
         "torch.cuda.empty_cache()",
-        "(torch.cuda.empty_cache() if torch.cuda.is_available() else None)",
+        "(torch.cuda.empty_cache() if torch.cuda.is_available()\n"
+        "         else torch.mps.empty_cache() if torch.backends.mps.is_available() else None)",
         path,
     )
     write_file(path, src)
@@ -720,35 +510,6 @@ def patch_inference_tmpdir():
     write_file(path, src)
 
 
-def patch_inference_alpha_mode():
-    """Force opaque GLBs back to alphaMode=OPAQUE before export — works
-    around o_voxel's hair-trigger BLEND flag on bf16 drift texels
-    (pedronaugusto/trellis2-apple#1). Without this, opaque models render
-    see-through in glTF viewers."""
-    path = os.path.join(PIXAL_ROOT, "inference.py")
-    src = read_file(path)
-
-    if "fix_alpha_mode" in src:
-        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
-        return
-
-    src = sub(
-        src,
-        "    # Apply rotation\n",
-        "    import sys as _sys, os as _os\n"
-        "    _sys.path.append(_os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'backends'))\n"
-        "    try:\n"
-        "        from glb_postprocess import fix_alpha_mode\n"
-        "        fix_alpha_mode(glb)\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "\n"
-        "    # Apply rotation\n",
-        path,
-    )
-    write_file(path, src)
-
-
 def patch_inference_to_glb_cpu():
     """Hand mesh tensors to o_voxel.postprocess.to_glb on CPU. The Metal
     o_voxel/cumesh stack creates internal tensors on CPU and mixes them with
@@ -769,6 +530,37 @@ def patch_inference_to_glb_cpu():
         "    glb = o_voxel.postprocess.to_glb(\n"
         "        vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(), attr_volume=mesh.attrs.cpu(),\n"
         "        coords=mesh.coords.cpu(), attr_layout=pipeline.pbr_attr_layout,",
+        path,
+    )
+    write_file(path, src)
+
+
+def patch_inference_free_before_export():
+    """Release the models and cached GPU buffers before to_glb. The export
+    (narrow-band remesh, UV unwrap, bake) needs only the mesh, and at 1536 its
+    working set is large enough that keeping the pipeline resident pushes a
+    64 GB Mac deep into swap."""
+    path = os.path.join(PIXAL_ROOT, "inference.py")
+    src = read_file(path)
+
+    if "# free models before export" in src:
+        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
+        return
+
+    src = sub(
+        src,
+        "    glb = o_voxel.postprocess.to_glb(\n"
+        "        vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(), attr_volume=mesh.attrs.cpu(),\n"
+        "        coords=mesh.coords.cpu(), attr_layout=pipeline.pbr_attr_layout,",
+        "    # free models before export\n"
+        "    attr_layout = pipeline.pbr_attr_layout\n"
+        "    del pipeline, mesh_list, shape_slat, tex_slat\n"
+        "    import gc; gc.collect()\n"
+        "    if torch.backends.mps.is_available():\n"
+        "        torch.mps.empty_cache()\n"
+        "    glb = o_voxel.postprocess.to_glb(\n"
+        "        vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(), attr_volume=mesh.attrs.cpu(),\n"
+        "        coords=mesh.coords.cpu(), attr_layout=attr_layout,",
         path,
     )
     write_file(path, src)
@@ -802,8 +594,6 @@ def main():
         print("Run setup.sh first to clone the repository.")
         return False
 
-    patch_windowed_attention()
-    patch_full_attn_mtlattn()
     patch_pipeline_base()
     patch_birefnet()
     patch_birefnet_fallback()
@@ -811,13 +601,12 @@ def main():
     patch_image_conditioned_proj()
     patch_naf()
     patch_mesh_base()
-    patch_pipeline_fill_holes_fallback()
     patch_fdg_vae()
     patch_pipeline()
     patch_inference()
     patch_inference_tmpdir()
     patch_inference_to_glb_cpu()
-    patch_inference_alpha_mode()
+    patch_inference_free_before_export()
     install_conv_backend()
     install_mesh_extract()
 
