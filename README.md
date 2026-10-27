@@ -35,7 +35,8 @@ mirror, BiRefNet) are ungated — **no HuggingFace login required**.
 - Python 3.11+
 - Xcode with the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
   for the Metal backends; without it, setup falls back to slower pure-PyTorch paths
-- ~20 GB disk for model weights (downloaded on first run)
+- ~20 GB disk for model weights (downloaded on first run), plus 16.5 GB for
+  the multi-view weights if you use `--views_dir`
 
 ## Quick start
 
@@ -49,13 +50,30 @@ python generate.py --image photo.png --output out/model.glb
 # Batch: pipeline + MoGe + rembg load once and stay resident in unified
 # memory — each extra image costs only its generation time
 python generate.py --batch images/ --output-dir out/
+
+# Multi-view: several posed views of one object (forwards to inference_mv.py)
+python generate.py --views_dir views/ --output out/model.glb
 ```
+
+### Multiple views
+
+Upstream Pixal3D can condition on several views of the same object, using a
+separate set of multi-view weights (16.5 GB more, downloaded on first use).
+The views directory holds the images plus a `transforms.json` with each
+view's camera; `Pixal3D/assets/mv_images/example` is a working input. For the
+usual four shots at 0°/90°/180°/270° around the object at eye level, copy that
+example's `transforms.json` and point its `file_path`s at your images. The
+first view must be the front. Views without an alpha channel are
+background-matted automatically; they are not cropped, so frame them the way
+the cameras describe. `--num_views N` uses only the first N views. See the
+[upstream README](https://github.com/TencentARC/Pixal3D#multi-view-inference)
+for the camera convention.
 
 `generate.py` supports the official flags (`--seed`, `--fov`,
 `--resolution 1024|1536`, `--low_vram`) and **auto-configures by unified
-memory** when flags are omitted: ≥64 GB → 1536 cascade (batch mode and the
-web UI keep models resident, so they need ≥96 GB for 1536); ≥24 GB → 1024
-cascade, all models resident; <24 GB → 1024 + low-VRAM mode.
+memory** when flags are omitted: ≥64 GB → 1536 cascade (batch mode, the web
+UI and multi-view need ≥96 GB for 1536); ≥24 GB → 1024 cascade, all models
+resident; <24 GB → 1024 + low-VRAM mode.
 
 `setup.sh` pins every source it fetches — Pixal3D, the Metal stack, MoGe and
 `torch==2.14.1` — to tested versions, so an upstream change can't silently
@@ -78,6 +96,7 @@ checkout in place:
 | `torch.cuda.synchronize` → MPS | no CUDA |
 | `inference.py` device portability | `device="cuda"` defaults |
 | mesh tensors handed to `to_glb` on CPU | Metal cumesh remesher mixes internal CPU tensors with inputs |
+| `inference_mv.py`: same device / attention / export fixes as `inference.py` | multi-view CLI has the same CUDA assumptions |
 | `torch.cuda.empty_cache()` → `torch.mps.empty_cache()`; models freed before export | without it the MPS allocator keeps every stage's buffers and the 1536 export runs a 64 GB Mac out of memory |
 | create output dir before tmp-image save | upstream ordering bug |
 
@@ -97,12 +116,13 @@ Metal kernel, [mtlattn](https://github.com/lastowl/mtlattn), for this; on torch
 ## Status
 
 Validated on an M5 Pro (64 GB, macOS 26.5, torch 2.14.1) with the shoe test
-image:
+image, and upstream's four-view example for multi-view:
 
 | | time | notes |
 |---|---|---|
 | 1024 cascade | ~7.5 min | ~1M-face GLB, 4096² PBR textures, opaque |
 | 1536 cascade | ~13.5 min | export is the memory peak (10–13 GB of swap on 64 GB) |
+| multi-view, 4 views, 1024 | ~11.5 min | 1536 multi-view swap-thrashes on 64 GB, so auto-config only picks it at ≥96 GB (untested there) |
 
 That's 1.2× (1024) and 1.8× (1536) faster than this port's previous release
 (torch 2.12 + mtlattn), mostly from torch 2.14's attention kernel.

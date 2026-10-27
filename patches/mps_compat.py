@@ -316,6 +316,19 @@ def patch_naf():
         "                ).to(lr_features_bchw.device, dtype=lr_features_bchw.dtype)  # [B, D, H', W']",
         path,
     )
+
+    # Same for the multi-view extractor's per-view call (inference_mv.py).
+    src = sub(
+        src,
+        "            hr_features = self.naf_model(image_for_naf, lr_features_bchw, self.naf_target_size)\n",
+        "            _naf_dev = next(self.naf_model.parameters()).device\n"
+        "            hr_features = self.naf_model(\n"
+        "                image_for_naf.to(_naf_dev, dtype=torch.float32),\n"
+        "                lr_features_bchw.to(_naf_dev, dtype=torch.float32),\n"
+        "                self.naf_target_size,\n"
+        "            ).to(lr_features_bchw.device, dtype=lr_features_bchw.dtype)\n",
+        path,
+    )
     write_file(path, src)
 
 
@@ -566,6 +579,53 @@ def patch_inference_free_before_export():
     write_file(path, src)
 
 
+def patch_inference_mv():
+    """The multi-view CLI (inference_mv.py) has the same CUDA assumptions as
+    inference.py: flash_attn default, device="cuda", MPS tensors handed to
+    to_glb, models kept resident through export."""
+    path = os.path.join(PIXAL_ROOT, "inference_mv.py")
+    src = read_file(path)
+
+    if "DEFAULT_DEVICE" in src:
+        print(f"  Already patched: {os.path.relpath(path, PIXAL_ROOT)}")
+        return
+
+    src = sub(
+        src,
+        'os.environ.setdefault("ATTN_BACKEND", "flash_attn")',
+        'os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")\n'
+        'os.environ.setdefault("ATTN_BACKEND", "sdpa" if not torch.cuda.is_available() else "flash_attn")\n'
+        'os.environ.setdefault("SPARSE_ATTN_BACKEND", os.environ["ATTN_BACKEND"])',
+        path,
+    )
+    src = sub(
+        src,
+        "from pixal3d.pipelines import Pixal3DMVImageTo3DPipeline",
+        'DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cuda"\n'
+        "\n"
+        "from pixal3d.pipelines import Pixal3DMVImageTo3DPipeline",
+        path,
+    )
+    src = sub(src, 'device="cuda"', "device=DEFAULT_DEVICE", path)
+    src = sub(
+        src,
+        "    glb = o_voxel.postprocess.to_glb(\n"
+        "        vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,\n"
+        "        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,",
+        "    # free models before export\n"
+        "    attr_layout = pipeline.pbr_attr_layout\n"
+        "    del pipeline, mesh_list, shape_slat, tex_slat\n"
+        "    import gc; gc.collect()\n"
+        "    if torch.backends.mps.is_available():\n"
+        "        torch.mps.empty_cache()\n"
+        "    glb = o_voxel.postprocess.to_glb(\n"
+        "        vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(), attr_volume=mesh.attrs.cpu(),\n"
+        "        coords=mesh.coords.cpu(), attr_layout=attr_layout,",
+        path,
+    )
+    write_file(path, src)
+
+
 def install_conv_backend():
     """Pure-PyTorch sparse conv fallback (SPARSE_CONV_BACKEND=none)."""
     dst = os.path.join(PIXAL_ROOT, "pixal3d/modules/sparse/conv/conv_none.py")
@@ -607,6 +667,7 @@ def main():
     patch_inference_tmpdir()
     patch_inference_to_glb_cpu()
     patch_inference_free_before_export()
+    patch_inference_mv()
     install_conv_backend()
     install_mesh_extract()
 

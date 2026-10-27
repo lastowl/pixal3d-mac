@@ -117,7 +117,7 @@ if [ "$RAM_GB" -ge 96 ]; then
     echo "  -> full-quality 1536 cascade, all models resident"
 elif [ "$RAM_GB" -ge 64 ]; then
     echo "  -> 1536 cascade for single images (models are freed before export;"
-    echo "     expect some swap); batch mode and the web UI default to 1024"
+    echo "     expect some swap); batch, multi-view and the web UI default to 1024"
 elif [ "$RAM_GB" -ge 24 ]; then
     echo "  -> 1024 cascade, all models resident"
 else

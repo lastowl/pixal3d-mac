@@ -5,6 +5,11 @@ Single image (forwards to the official Pixal3D/inference.py CLI):
 
     python generate.py --image photo.png --output out/model.glb --resolution 1024
 
+Multi-view (forwards to Pixal3D/inference_mv.py; a directory of posed views
+plus transforms.json, see Pixal3D/assets/mv_images/example):
+
+    python generate.py --views_dir views/ --output out/model.glb
+
 Batch mode (unified-memory optimization: pipeline, MoGe and rembg are loaded
 once and stay resident — saves ~6 min of model loading per image vs the
 upstream flow, which reloads everything per run to protect a small VRAM pool):
@@ -44,13 +49,13 @@ def unified_memory_gb():
         return 0.0
 
 
-def auto_defaults(batch=False):
+def auto_defaults(batch=False, multiview=False):
     """Pick pipeline defaults from the machine's unified memory.
 
     Pixal3D standard mode keeps ~18 GB of models resident. Tiers
     (overridable via explicit CLI flags):
-      >= 64 GB: full-quality 1536 cascade (single image; batch mode needs
-                >= 96 GB, see below)
+      >= 64 GB: full-quality 1536 cascade (single image; batch and
+                multi-view need >= 96 GB, see below)
       >= 24 GB: 1024 cascade, everything resident
       <  24 GB: 1024 cascade, low-VRAM mode (models loaded per stage),
                 reduced sparse-token budget
@@ -59,10 +64,12 @@ def auto_defaults(batch=False):
     peak: ~100 GB footprint on its own, which a 64 GB Mac covers with memory
     compression and 10–13 GB of swap once the models are freed first
     (inference.py does that). Batch mode keeps the models resident through
-    export, so it only defaults to 1536 on 96 GB+.
+    export, and multi-view carries one set of conditioning features per view
+    through sampling (4 views at 1536 swap-thrash a 64 GB Mac), so both only
+    default to 1536 on 96 GB+.
     """
     gb = unified_memory_gb()
-    if gb >= (96 if batch else 64):
+    if gb >= (96 if batch or multiview else 64):
         return {"resolution": 1536, "low_vram": False, "max_num_tokens": 49152, "ram_gb": gb}
     if gb >= 24:
         return {"resolution": 1024, "low_vram": False, "max_num_tokens": 49152, "ram_gb": gb}
@@ -199,12 +206,14 @@ if __name__ == "__main__":
         run_batch()
     else:
         # Inject RAM-based defaults unless the user chose explicitly.
-        auto = auto_defaults()
+        auto = auto_defaults(multiview="--views_dir" in sys.argv)
         if "--resolution" not in sys.argv:
             sys.argv += ["--resolution", str(auto["resolution"])]
         if auto["low_vram"] and "--low_vram" not in sys.argv:
             sys.argv.append("--low_vram")
         print(f"[auto-config] {auto['ram_gb']:.0f} GB unified memory -> "
-              f"resolution {auto['resolution']}, low_vram={auto['low_vram']}")
+              f"resolution {sys.argv[sys.argv.index('--resolution') + 1]}, "
+              f"low_vram={'--low_vram' in sys.argv}")
+        script = "inference_mv.py" if "--views_dir" in sys.argv else "inference.py"
         import runpy
-        runpy.run_path(os.path.join(PIXAL_ROOT, "inference.py"), run_name="__main__")
+        runpy.run_path(os.path.join(PIXAL_ROOT, script), run_name="__main__")
